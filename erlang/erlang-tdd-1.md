@@ -243,7 +243,7 @@ done (passed successfully)
 zen:worker_net-0.1 zenon$
 ```
 
-当然这不是第一此编译(在这之前,我解决了一下错误和问题.)
+当然这不是第一次编译(在这之前,我解决了一些错误和问题.)
 添加第一个测试来检测是否能够添加和访问远程节点上的资源. 添加并重构测试,添加的测试生成器为:
 
 ```erlang
@@ -360,3 +360,428 @@ resource_collector(From) ->
 The fix seen above in `wn_resource_layer.erl` was to add the case-of with `rpc:call/4` `erlang:whereis(?MODULE)`.
 Fixed and running, the `make full` reports. What is now left to fulfill the initial `requirements` is a test that proves the ability to deregister resources dynamically through any node.
 Test first as always.
+
+```erlang
+register_deregister([N1, N2]) ->
+    {"Can Register, Deregister and Register", fun() ->
+        rpc:call(N1, wn_resource_layer, start_link, []),
+        rpc:call(N2, wn_resource_layer, start_link, []),
+        M = fun() -> lists:sort(wn_resource_layer:list_resources()) end,
+        S1 = fun() -> lists:sort(rpc:call(N1, wn_resource_layer, list_resources, [])) end,
+        S2 = fun() -> lists:sort(rpc:call(N2, wn_resource_layer, list_resources, [])) end,
+        ResourceA = #wn_resource{name = "A", type = [{a, 1}], resides = N1},
+        ResourceB = #wn_resource{name = "B", type = [{b, 2}], resides = N2},
+        ResourceC = #wn_resource{name = "C", type = [{c, 3}], resides = node()},
+        ok = wn_resource_layer:register(ResourceA),
+        ok = wn_resource_layer:register(ResourceB),
+        ok = wn_resource_layer:register(ResourceC),
+        ?assertEqual([ResourceA, ResourceB, ResourceC], M()),
+        ?assertEqual([ResourceA, ResourceB, ResourceC], S1()),
+        ?assertEqual([ResourceA, ResourceB, ResourceC], S2()),
+        ?assertEqual(ok, wn_resource_layer:deregister(N1, "A")),
+        ?assertEqual([ResourceB, ResourceC], M()),
+        ?assertEqual([ResourceB, ResourceC], S1()),
+        ?assertEqual([ResourceB, ResourceC], S2()),
+        ?assertEqual(ok, wn_resource_layer:deregister(N2, "B")),
+        ?assertEqual([ResourceC], M()),
+        ?assertEqual([ResourceC], S1()),
+        ?assertEqual([ResourceC], S2()),
+        ?assertEqual(ok, wn_resource_layer:deregister(node(), "C")),
+        ?assertEqual([], M()),
+        ?assertEqual([], S1()),
+        ?assertEqual([], S2()),
+        ok = wn_resource_layer:register(ResourceA),
+        ok = wn_resource_layer:register(ResourceB),
+        ok = wn_resource_layer:register(ResourceC),
+        ?assertEqual([ResourceA, ResourceB, ResourceC], M()),
+        ?assertEqual([ResourceA, ResourceB, ResourceC], S1()),
+        ?assertEqual([ResourceA, ResourceB, ResourceC], S2())
+    end}.
+```
+
+Then the necessary changes to make the tests pass, changes to API in wn_resource_layer
+
+```erlang
+-spec(deregister(node(), string()) -> ok | {error, term()}).
+deregister(Node, Name) ->
+    gen_server:call(?MODULE, {deregister, Node, Name}).
+```
+
+the added handling inside the callbacks
+
+```erlang
+handle_call({deregister, Node, Name}, From, State) ->
+    case {Node == node(), lists:member(Node, nodes())} of
+        {true, _} ->
+            Reply = try_deregister(State, Name),
+            {reply, Reply, State};
+        {false, true} ->
+            gen_server:cast({?MODULE, Node}, {deregister, From, Node, Name}),
+            {noreply, State};
+        {false, false} ->
+            {reply, {error, noresides}, State}
+    end.
+
+handle_cast({deregister, From, _Node, Name}, State) ->
+    gen_server:reply(From, try_deregister(State, Name)),
+    {noreply, State};
+```
+
+`make full`
+
+```sh
+zen:worker_net-0.1 zenon$ make full
+erlc -pa . -o ebin/  src/*.erl test/*.erl
+erl -pa ebin/ -eval 'eunit:test(wn_resource_layer,[verbose]), init:stop().'
+Erlang R14B (erts-5.8.1) [source] [smp:4:4] [rq:4] [async-threads:0] [hipe]
+[kernel-poll:false]
+
+Eshell V5.8.1  (abort with ^G)
+1> ======================== EUnit ========================
+module 'wn_resource_layer'
+  module 'wn_resource_layer_tests'
+    wn_resource_layer_tests: local_resource_test_ (Can register resources locally)...ok
+    wn_resource_layer_tests: register_distributed (Can Register Distributed)...[0.004 s] ok
+    wn_resource_layer_tests: register_restart_register (Can Register, Restart and Register)...[0.008 s] ok
+    wn_resource_layer_tests: register_deregister (Can Register, Deregister and Register)...[0.012 s] ok
+    [done in 0.885 s]
+  [done in 0.885 s]
+=======================================================
+  All 4 tests passed.
+dialyzer src/*.erl test/*.erl
+  Checking whether the PLT /Users/zenon/.dialyzer_plt is up-to-date... yes
+  Proceeding with analysis...
+Unknown functions:
+  eunit:test/1
+ done in 0m1.13s
+done (passed successfully)
+zen:worker_net-0.1 zenon$
+```
+
+现在基本上完全满足了在开始的时候提到的初步需求:
+
+* "我想要能够指定我的资源类型, 资源应该可以有多种类型."
+* "对于那些我注册的资源,我想要能够为每种资源类型指定可用资源的数量,"
+* "我想要能够在任何节点上动态地注册和注销我的资源."
+* "我想要能够在任何节点上的资源层列出可用的资源."
+
+当前的设计是一个"本地有限,分布其次"的设计如下:
+
+下一个迭代将处理文件层相关的工作.
+
+下面是本文中 `wn_resource_layer.erl` 和 `wn_resource_layer_tests.erl` 完整的代码清单:
+
+
+Listing: wn_resource_layer.erl
+--------------------------------------
+
+```erlang
+%%%-------------------------------------------------------------------
+%%% @author Gianfranco <zenon@zen.local>
+%%% @copyright (C) 2010, Gianfranco
+%%% Created : 11 Dec 2010 by Gianfranco <zenon@zen.local>
+%%%-------------------------------------------------------------------
+-module(wn_resource_layer).
+-behaviour(gen_server).
+-include("include/worker_net.hrl").
+
+%% API
+-export([start_link/0, register/1, list_resources/0, stop/0,
+    deregister/2]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+    terminate/2, code_change/3]).
+
+-record(state,
+{resources %% ETS table
+}).
+
+%%%===================================================================
+%%% API
+%%%===================================================================
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, not_used, []).
+
+-spec(register(#wn_resource{}) -> ok | {error, term()}).
+register(Resource) ->
+    gen_server:call(?MODULE, {register, Resource}).
+
+-spec(deregister(node(), string()) -> ok | {error, term()}).
+deregister(Node, Name) ->
+    gen_server:call(?MODULE, {deregister, Node, Name}).
+
+-spec(list_resources() -> [#wn_resource{}]).
+list_resources() ->
+    gen_server:call(?MODULE, list_all_resources).
+
+-spec(stop() -> ok).
+stop() ->
+    gen_server:call(?MODULE, stop).
+
+%%%===================================================================
+%%% gen_server callbacks
+%%%===================================================================
+
+init(not_used) ->
+    {ok, #state{resources = ets:new(resources, [set])}}.
+
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
+
+handle_call(list_all_resources, From, State) ->
+    spawn_link(resource_collector(From)),
+    {noreply, State};
+
+handle_call(list_resources, _From, State) ->
+    {reply, [V || {_, V} <- ets:tab2list(State#state.resources)], State};
+
+handle_call({register, Resource}, From, State) ->
+    #wn_resource{resides = Node} = Resource,
+    case {Node == node(), lists:member(Node, nodes())} of
+        {true, _} ->
+            Reply = try_register(State, Resource),
+            {reply, Reply, State};
+        {false, true} ->
+            gen_server:cast({?MODULE, Node}, {register, From, Resource}),
+            {noreply, State};
+        {false, false} ->
+            {reply, {error, noresides}, State}
+    end;
+
+handle_call({deregister, Node, Name}, From, State) ->
+    case {Node == node(), lists:member(Node, nodes())} of
+        {true, _} ->
+            Reply = try_deregister(State, Name),
+            {reply, Reply, State};
+        {false, true} ->
+            gen_server:cast({?MODULE, Node}, {deregister, From, Node, Name}),
+            {noreply, State};
+        {false, false} ->
+            {reply, {error, noresides}, State}
+    end.
+
+handle_cast({deregister, From, _Node, Name}, State) ->
+    gen_server:reply(From, try_deregister(State, Name)),
+    {noreply, State};
+
+handle_cast({register, From, Resource}, State) ->
+    gen_server:reply(From, try_register(State, Resource)),
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+try_deregister(State, Name) ->
+    case ets:lookup(State#state.resources, Name) of
+        [] -> {error, noexists};
+        _ -> ets:delete(State#state.resources, Name),
+            ok
+    end.
+
+try_register(State, Resource) ->
+    #wn_resource{name = Name} = Resource,
+    case ets:lookup(State#state.resources, Name) of
+        [] -> ets:insert(State#state.resources, {Name, Resource}),
+            ok;
+        _ ->
+            {error, already_exists}
+    end.
+
+resource_collector(From) ->
+    Nodes = [node() | nodes()],
+    fun() ->
+        Res =
+            lists:foldr(
+                fun(Node, Acc) ->
+                    case rpc:call(Node, erlang, whereis, [?MODULE]) of
+                        undefined -> Acc;
+                        _Pid ->
+                            gen_server:call({?MODULE, Node},
+                                list_resources) ++ Acc
+                    end
+                end, [], Nodes),
+        gen_server:reply(From, Res)
+    end.
+```
+
+Listing: wn_resource_layer_tests.erl
+----------------------------------------------
+
+```erlang
+%%% @author Gianfranco <zenon@zen.local>
+%%% @copyright (C) 2010, Gianfranco
+%%% Created : 10 Dec 2010 by Gianfranco <zenon@zen.local>
+-module(wn_resource_layer_tests).
+-include_lib("eunit/include/eunit.hrl").
+-include("include/worker_net.hrl").
+
+local_resource_test_() ->
+    {foreach,
+        fun setup/0,
+        fun cleanup/1,
+        [{"Can register resources locally", fun register_locally/0}
+        ]}.
+
+distr_resource_test_() ->
+    {foreach,
+        fun distr_setup/0,
+        fun distr_cleanup/1,
+        [fun register_distributed/1,
+            fun register_restart_register/1,
+            fun register_deregister/1
+        ]
+    }.
+
+register_locally() ->
+    ResourceA = #wn_resource{name = "macbook pro laptop",
+    type = [{'os-x', 1}, {bsd, 1}],
+    resides = node()},
+    ResourceB = #wn_resource{name = "erlang runtime system",
+    type = [{erlang, 4}],
+    resides = node()},
+    ok = wn_resource_layer:register(ResourceA),
+    ok = wn_resource_layer:register(ResourceB),
+    List = lists:sort(wn_resource_layer:list_resources()),
+    ?assertMatch([ResourceB, ResourceA], List).
+
+register_distributed([N1, N2]) ->
+    {"Can Register Distributed",
+        fun() ->
+            rpc:call(N1, wn_resource_layer, start_link, []),
+            rpc:call(N2, wn_resource_layer, start_link, []),
+            ResourceA = #wn_resource{name = "erlang R14",
+            type = [{erlang, infinity}],
+            resides = N1},
+            ResourceB = #wn_resource{name = "os-x macbook pro",
+            type = [{'os-x', 1}],
+            resides = N2},
+            ResourceC = #wn_resource{name = "g++",
+            type = [{'g++', 1}],
+            resides = node()},
+            ok = wn_resource_layer:register(ResourceA),
+            ok = wn_resource_layer:register(ResourceB),
+            ok = wn_resource_layer:register(ResourceC),
+            ListA = lists:sort(wn_resource_layer:list_resources()),
+            ListB = lists:sort(rpc:call(N1, wn_resource_layer, list_resources, [])),
+            ListC = lists:sort(rpc:call(N2, wn_resource_layer, list_resources, [])),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], ListA),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], ListB),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], ListC)
+        end}.
+
+register_restart_register([N1, N2]) ->
+    {"Can Register, Restart and Register",
+        fun() ->
+            rpc:call(N1, wn_resource_layer, start_link, []),
+            rpc:call(N2, wn_resource_layer, start_link, []),
+            ResourceA = #wn_resource{name = "erlang R14",
+            type = [{erlang, infinity}],
+            resides = N1},
+            ResourceB = #wn_resource{name = "os-x macbook pro",
+            type = [{'os-x', 1}],
+            resides = N2},
+            ResourceC = #wn_resource{name = "g++",
+            type = [{'g++', 1}],
+            resides = node()},
+            ok = wn_resource_layer:register(ResourceA),
+            ok = wn_resource_layer:register(ResourceB),
+            ok = wn_resource_layer:register(ResourceC),
+            M = fun() -> lists:sort(wn_resource_layer:list_resources()) end,
+            S1 = fun() -> lists:sort(rpc:call(N1, wn_resource_layer, list_resources, [])) end,
+            S2 = fun() -> lists:sort(rpc:call(N2, wn_resource_layer, list_resources, [])) end,
+            ?assertEqual([ResourceA, ResourceC, ResourceB], M()),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], S1()),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], S2()),
+            rpc:call(N1, wn_resource_layer, stop, []),
+            ?assertEqual([ResourceC, ResourceB], M()),
+            ?assertEqual([ResourceC, ResourceB], S2()),
+            rpc:call(N2, wn_resource_layer, stop, []),
+            ?assertEqual([ResourceC], M()),
+            {ok, _} = rpc:call(N1, wn_resource_layer, start_link, []),
+            {ok, _} = rpc:call(N2, wn_resource_layer, start_link, []),
+            ok = wn_resource_layer:register(ResourceA),
+            ?assertEqual([ResourceA, ResourceC], M()),
+            ok = wn_resource_layer:register(ResourceB),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], M()),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], S1()),
+            ?assertEqual([ResourceA, ResourceC, ResourceB], S2())
+        end}.
+
+register_deregister([N1, N2]) ->
+    {"Can Register, Deregister and Register",
+        fun() ->
+            rpc:call(N1, wn_resource_layer, start_link, []),
+            rpc:call(N2, wn_resource_layer, start_link, []),
+            M = fun() -> lists:sort(wn_resource_layer:list_resources()) end,
+            S1 = fun() -> lists:sort(rpc:call(N1, wn_resource_layer, list_resources, [])) end,
+            S2 = fun() -> lists:sort(rpc:call(N2, wn_resource_layer, list_resources, [])) end,
+            ResourceA = #wn_resource{name = "A", type = [{a, 1}], resides = N1},
+            ResourceB = #wn_resource{name = "B", type = [{b, 2}], resides = N2},
+            ResourceC = #wn_resource{name = "C", type = [{c, 3}], resides = node()},
+            ok = wn_resource_layer:register(ResourceA),
+            ok = wn_resource_layer:register(ResourceB),
+            ok = wn_resource_layer:register(ResourceC),
+            ?assertEqual([ResourceA, ResourceB, ResourceC], M()),
+            ?assertEqual([ResourceA, ResourceB, ResourceC], S1()),
+            ?assertEqual([ResourceA, ResourceB, ResourceC], S2()),
+            ?assertEqual(ok, wn_resource_layer:deregister(N1, "A")),
+            ?assertEqual([ResourceB, ResourceC], M()),
+            ?assertEqual([ResourceB, ResourceC], S1()),
+            ?assertEqual([ResourceB, ResourceC], S2()),
+            ?assertEqual(ok, wn_resource_layer:deregister(N2, "B")),
+            ?assertEqual([ResourceC], M()),
+            ?assertEqual([ResourceC], S1()),
+            ?assertEqual([ResourceC], S2()),
+            ?assertEqual(ok, wn_resource_layer:deregister(node(), "C")),
+            ?assertEqual([], M()),
+            ?assertEqual([], S1()),
+            ?assertEqual([], S2()),
+            ok = wn_resource_layer:register(ResourceA),
+            ok = wn_resource_layer:register(ResourceB),
+            ok = wn_resource_layer:register(ResourceC),
+            ?assertEqual([ResourceA, ResourceB, ResourceC], M()),
+            ?assertEqual([ResourceA, ResourceB, ResourceC], S1()),
+            ?assertEqual([ResourceA, ResourceB, ResourceC], S2())
+        end}.
+
+%% -----------------------------------------------------------------
+setup() ->
+    {ok, _} = net_kernel:start([eunit_resource, shortnames]),
+    erlang:set_cookie(node(), eunit),
+    {ok, _} = wn_resource_layer:start_link().
+
+cleanup(_) ->
+    ok = net_kernel:stop(),
+    ok = wn_resource_layer:stop().
+
+distr_setup() ->
+    setup(),
+    Host = list_to_atom(inet_db:gethostname()),
+    Args = " -pa " ++ hd(code:get_path()) ++ " -setcookie eunit",
+    {ok, N1} = slave:start(Host, n1, Args),
+    {ok, N2} = slave:start(Host, n2, Args),
+    rpc:call(N1, net_kernel, connect_node, [N2]),
+    [N1, N2].
+
+distr_cleanup([N1, N2]) ->
+    rpc:call(N1, wn_resource_layer, stop, []),
+    rpc:call(N2, wn_resource_layer, stop, []),
+    slave:stop(N1),
+    slave:stop(N2),
+    cleanup(nothing).
+```
+
+
+
+
