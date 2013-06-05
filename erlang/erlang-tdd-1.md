@@ -103,3 +103,260 @@ cleanup(_) ->
     ok = net_kernel:stop(),
     ok = wn_resource_layer:stop().
 ```
+
+
+头文件
+
+```erlang
+%%% @author Gianfranco <zenon@zen.local>
+%%% @copyright (C) 2010, Gianfranco
+%%% Created : 10 Dec 2010 by Gianfranco <zenon@zen.local>
+
+-record(wn_resource,
+{name :: string(),
+    type :: [{atom(), non_neg_integer() | infinity}],
+    resides :: node()
+}).
+```
+
+尽可能的完善类型声明,这样可以使用dialyzer对代码进行静态分析.接下来花一点时间实现,插入`gen_server`框架代码,在这个基础上修改和添加函数
+
+API
+
+```erlang
+%%%===========================================================
+%%% API
+%%%===========================================================
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, not_used, []).
+
+-spec(register(#wn_resource{}) -> ok | {error, term()}).
+register(Resource) ->
+    gen_server:call(?MODULE, {register, Resource}).
+
+-spec(list_resources() -> [#wn_resource{}]).
+list_resources() ->
+    gen_server:call(?MODULE, list_all_resources).
+
+-spec(stop() -> ok).
+stop() ->
+    gen_server:call(?MODULE, stop).
+```
+
+
+修改的回调函数
+
+
+```erlang
+init(not_used) ->
+    {ok, #state{resources = ets:new(resources, [set])}}.
+
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
+
+handle_call(list_all_resources, From, State) ->
+    spawn_link(resource_collector(From)),
+    {noreply, State};
+
+handle_call(list_resources, _From, State) ->
+    {reply, [V || {_, V} <- ets:tab2list(State#state.resources)], State};
+
+handle_call({register, Resource}, From, State) ->
+    #wn_resource{resides = Node} = Resource,
+    case {Node == node(), lists:member(Node, nodes())} of
+        {true, _} ->
+            Reply = try_register(State, Resource),
+            {reply, Reply, State};
+        {false, true} ->
+            gen_server:cast({?MODULE, Node}, {register, From, Resource}),
+            {noreply, State};
+        {false, false} ->
+            {reply, {error, noresides}, State}
+    end.
+
+handle_cast({register, From, Resource}, State) ->
+    gen_server:reply(From, try_register(State, Resource)),
+    {noreply, State}.
+```
+
+添加内部函数到 `wn_resource_layer.erl`
+
+```erlang
+%%%===========================================================
+%%% Internal functions
+%%%===========================================================
+try_register(State, Resource) ->
+    #wn_resource{name = Name} = Resource,
+    case ets:lookup(State#state.resources, Name) of
+        [] -> ets:insert(State#state.resources, {Name, Resource}),
+            ok;
+        _ ->
+            {error, already_exists}
+    end.
+
+resource_collector(From) ->
+    Nodes = [node() | nodes()],
+    fun() ->
+        Res =
+            lists:foldr(
+                fun(Node, Acc) ->
+                    gen_server:call({?MODULE, Node}, list_resources) ++ Acc
+                end, [], Nodes),
+        gen_server:reply(From, Res)
+    end.
+```
+
+现在创建`Makefile`
+
+```sh
+all:
+     erlc -pa . -o ebin/  src/*.erl test/*.erl
+
+test:  all
+     erl -pa ebin/ -eval 'eunit:test(wn_resource_layer), init:stop().'
+
+dialyze:
+     dialyzer src/*.erl test/*.erl
+
+full: all test dialyze
+```
+
+运行`make full`获得如下结果
+
+```sh
+zen:worker_net-0.1 zenon$ make full
+erlc -pa . -o ebin/  src/*.erl test/*.erl
+erl -pa ebin/ -eval 'eunit:test(wn_resource_layer), init:stop().'
+Erlang R14B (erts-5.8.1) [source] [smp:4:4] [rq:4] [async-threads:0]
+[hipe] [kernel-poll:false]
+
+Eshell V5.8.1  (abort with ^G)
+1>   Test passed.
+dialyzer src/*.erl test/*.erl
+  Checking whether the PLT /Users/zenon/.dialyzer_plt is up-to-date... yes
+  Proceeding with analysis...
+Unknown functions:
+  eunit:test/1
+ done in 0m0.43s
+done (passed successfully)
+zen:worker_net-0.1 zenon$
+```
+
+当然这不是第一此编译(在这之前,我解决了一下错误和问题.)
+添加第一个测试来检测是否能够添加和访问远程节点上的资源. 添加并重构测试,添加的测试生成器为:
+
+```erlang
+distr_resource_test_() ->
+    {foreach,
+        fun distr_setup/0,
+        fun distr_cleanup/1,
+        [fun register_distributed/1
+        ]
+    }.
+```
+
+with an added test istantiator
+
+```erlang
+register_distributed([N1, N2]) ->
+    {"Can Register Distributed", fun() ->
+        rpc:call(N1, wn_resource_layer, start_link, []),
+        rpc:call(N2, wn_resource_layer, start_link, []),
+        ResourceA = #wn_resource{name = "erlang R14",
+        type = [{erlang, infinity}],
+        resides = N1},
+        ResourceB = #wn_resource{name = "os-x macbook pro",
+        type = [{'os-x', 1}],
+        resides = N2},
+        ResourceC = #wn_resource{name = "g++",
+        type = [{'g++', 1}],
+        resides = node()},
+        ok = wn_resource_layer:register(ResourceA),
+        ok = wn_resource_layer:register(ResourceB),
+        ok = wn_resource_layer:register(ResourceC),
+        ListA = lists:sort(wn_resource_layer:list_resources()),
+        ListB = lists:sort(rpc:call(N1, wn_resource_layer, list_resources, [])),
+        ListC = lists:sort(rpc:call(N2, wn_resource_layer, list_resources, [])),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], ListA),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], ListB),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], ListC)
+    end}.
+```
+
+
+This test passed without problem. Next test will test that the resource layer can be started and restarted with re-registration.
+This test starts a layer on slave nodes, registers, resources, accesses them, stops layers, starts layers, registers and finds resources. All in a controlled manner.
+
+测试全部通过,没有任何问题. 接下来测试资源层可以启动/重启.
+此测试在slave节点上启动资源层, 注册资源, 访问资源, 停止资源层, 启动资源层, 注册和查找资源.
+
+```erlang
+register_restart_register([N1, N2]) ->
+    {"Can Register, Restart and Register", fun() ->
+        rpc:call(N1, wn_resource_layer, start_link, []),
+        rpc:call(N2, wn_resource_layer, start_link, []),
+        ResourceA = #wn_resource{name = "erlang R14",
+        type = [{erlang, infinity}],
+        resides = N1},
+        ResourceB = #wn_resource{name = "os-x macbook pro",
+        type = [{'os-x', 1}],
+        resides = N2},
+        ResourceC = #wn_resource{name = "g++",
+        type = [{'g++', 1}],
+        resides = node()},
+        ok = wn_resource_layer:register(ResourceA),
+        ok = wn_resource_layer:register(ResourceB),
+        ok = wn_resource_layer:register(ResourceC),
+        M = fun() -> lists:sort(wn_resource_layer:list_resources()) end,
+        S1 = fun() -> lists:sort(rpc:call(N1, wn_resource_layer, list_resources, []))
+        end,
+        S2 = fun() -> lists:sort(rpc:call(N2, wn_resource_layer, list_resources, []))
+        end,
+        ?assertEqual([ResourceA, ResourceC, ResourceB], M()),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], S1()),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], S2()),
+        rpc:call(N1, wn_resource_layer, stop, []),
+        ?assertEqual([ResourceC, ResourceB], M()),
+        ?assertEqual([ResourceC, ResourceB], S2()),
+        rpc:call(N2, wn_resource_layer, stop, []),
+        ?assertEqual([ResourceC], M()),
+        {ok, _} = rpc:call(N1, wn_resource_layer, start_link, []),
+        {ok, _} = rpc:call(N2, wn_resource_layer, start_link, []),
+        ok = wn_resource_layer:register(ResourceA),
+        ?assertEqual([ResourceA, ResourceC], M()),
+        ok = wn_resource_layer:register(ResourceB),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], M()),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], S1()),
+        ?assertEqual([ResourceA, ResourceC, ResourceB], S2())
+    end}.
+```
+
+
+After having written the test and tried it with ‘make full’,
+It became evident that one flaw of the current implementation was that (should be for whoever is trying this out themselves)
+ is that the resource layer treats ALL seen nodes as having a resource layer running,
+this is not a healthy assumption not be the case and we need a fix to prevent the gen_server:call/2 in case there is no running wn_resource_layer gen_server running.
+
+在测试编写完成并执行`make full`后,
+
+```erlang
+resource_collector(From) ->
+    Nodes = [node() | nodes()],
+    fun() ->
+        Res =
+            lists:foldr(
+                fun(Node, Acc) ->
+                    case rpc:call(Node, erlang, whereis, [?MODULE]) of
+                        undefined -> Acc;
+                        _Pid ->
+                            gen_server:call({?MODULE, Node}, list_resources) ++ Acc
+                    end
+                end, [], Nodes),
+        gen_server:reply(From, Res)
+    end.
+```
+
+The fix seen above in `wn_resource_layer.erl` was to add the case-of with `rpc:call/4` `erlang:whereis(?MODULE)`.
+Fixed and running, the `make full` reports. What is now left to fulfill the initial `requirements` is a test that proves the ability to deregister resources dynamically through any node.
+Test first as always.
