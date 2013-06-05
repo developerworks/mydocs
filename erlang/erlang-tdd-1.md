@@ -2,7 +2,6 @@ Erlang 测试和测试驱动: Erlang TDD 项目实践 WorkerNet 第一部分
 ====================================
 
 History – Perl, Ericsson and late evenings
-历史 - Perl, 爱立信和深夜
 ---------------------------------------------------------
 
 This series of posts will go through the design, testing and implementation of a distributed Worker-Net (something that I saw/implemented @Ericsson AB in 2009 –
@@ -40,7 +39,6 @@ A layered (modular) architecture is often cleaner and easier to test, so such a 
 ![WorkerNet – What](https://raw.github.com/developerworks/mydocs/master/erlang/images/node1.png "WorkerNet – What")
 
 Iteration 1  - The design and testing of the Resource Layer
-迭代1 - 资源层的设计和测试
 --------------------------------------------------------------------------------
 
 The first iteration will start of with the test based design and implementation of the resource layer.
